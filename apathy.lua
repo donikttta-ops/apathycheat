@@ -1,11 +1,17 @@
 -- language: Lua, target: Roblox (Kemerovo RP), executor any
--- apathy v2 | Rayfield Amethyst | straight-flight (yaw-only) + noclip + ESP
-local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+-- apathy v2 | Rayfield Amethyst | anti-flip vehicle + global noclip + yaw-only flight
+local okRay, Rayfield = pcall(function()
+	return loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+end)
+if not okRay or not Rayfield then
+	warn("[apathy] Rayfield failed")
+	return
+end
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
-local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
@@ -14,19 +20,24 @@ local vehicleFlyEnabled = false
 local vehicleFlyActive = false
 local vehicleSpeed = 120
 local vehicleRoot = nil
+local vehicleModel = nil
 local vehicleBV = nil
+local vehicleBG = nil -- BodyGyro to prevent flip
 local vehicleConn = nil
 local vehicleMonitor = nil
 
 local playerNoclip = false
 local carNoclip = false
+local globalVehicleNoclip = false -- NEW: noclip for ALL vehicles
 local playerNoclipConn = nil
 local carNoclipConn = nil
+local globalNoclipConn = nil
 local originalCanCollide = {}
 local carOriginalCanCollide = {}
+local globalVehicleOriginalCanCollide = {} -- [part] = original CanCollide
 
 local espEnabled = false
-local espObjects = {} -- [player] = {box, name, dist}
+local espObjects = {}
 
 -- ===================== VEHICLE HELPERS =====================
 local function getVehicleRoot()
@@ -43,6 +54,20 @@ local function getVehicleRoot()
 	return seat, seat.Parent
 end
 
+local function isVehicleModel(model)
+	if not model or not model:IsA("Model") then return false end
+	-- heuristic: has PrimaryPart + contains Seat or VehicleSeat
+	if not model.PrimaryPart then return false end
+	local hasSeat = false
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("Seat") or child:IsA("VehicleSeat") then
+			hasSeat = true
+			break
+		end
+	end
+	return hasSeat
+end
+
 local function stopVehicleFly()
 	vehicleFlyActive = false
 	if vehicleConn then
@@ -53,21 +78,27 @@ local function stopVehicleFly()
 		vehicleBV:Destroy()
 		vehicleBV = nil
 	end
+	if vehicleBG then
+		vehicleBG:Destroy()
+		vehicleBG = nil
+	end
 	if vehicleRoot and vehicleRoot.Parent then
 		vehicleRoot.AssemblyLinearVelocity = Vector3.zero
 		vehicleRoot.AssemblyAngularVelocity = Vector3.zero
 	end
 	vehicleRoot = nil
+	vehicleModel = nil
 end
 
 local function startVehicleFly()
 	if vehicleFlyActive then return end
-	local root = getVehicleRoot()
+	local root, model = getVehicleRoot()
 	if not root then return end
 	vehicleRoot = root
+	vehicleModel = model
 	vehicleFlyActive = true
 
-	-- only BodyVelocity — no BodyGyro → no forced rotation / camera fight
+	-- BodyVelocity for movement
 	vehicleBV = Instance.new("BodyVelocity")
 	vehicleBV.Name = "ApathyFly"
 	vehicleBV.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
@@ -75,18 +106,32 @@ local function startVehicleFly()
 	vehicleBV.Velocity = Vector3.zero
 	vehicleBV.Parent = vehicleRoot
 
+	-- BodyGyro to PREVENT FLIP — locks orientation upright
+	vehicleBG = Instance.new("BodyGyro")
+	vehicleBG.Name = "ApathyAntiFlip"
+	vehicleBG.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+	vehicleBG.P = 1e5
+	vehicleBG.D = 500
+	vehicleBG.Parent = vehicleRoot
+
 	vehicleConn = RunService.Heartbeat:Connect(function()
 		if not vehicleFlyEnabled or not vehicleRoot or not vehicleRoot.Parent then
 			stopVehicleFly()
 			return
 		end
 
-		-- kill any residual spin / drift every frame
+		-- kill residual angular velocity
 		vehicleRoot.AssemblyAngularVelocity = Vector3.zero
+
+		-- ANTI-FLIP: lock CFrame to upright orientation
+		-- preserve current position but force upright rotation
+		local currentPos = vehicleRoot.Position
+		local uprightCFrame = CFrame.new(currentPos) * CFrame.Angles(0, 0, 0)
+		vehicleBG.CFrame = uprightCFrame
 
 		local camCF = Camera.CFrame
 		local look = camCF.LookVector
-		-- project to XZ plane (yaw only — ignore camera pitch)
+		-- project to XZ plane (yaw only)
 		local forward = Vector3.new(look.X, 0, look.Z)
 		if forward.Magnitude > 0.001 then
 			forward = forward.Unit
@@ -95,14 +140,12 @@ local function startVehicleFly()
 		end
 
 		local move = Vector3.zero
-		-- W = forward, S = backward (no A/D — straight only)
 		if UserInputService:IsKeyDown(Enum.KeyCode.W) then
 			move = move + forward
 		end
 		if UserInputService:IsKeyDown(Enum.KeyCode.S) then
 			move = move - forward
 		end
-		-- E / Space = up, Q / Ctrl = down
 		if UserInputService:IsKeyDown(Enum.KeyCode.E) or UserInputService:IsKeyDown(Enum.KeyCode.Space) then
 			move = move + Vector3.new(0, 1, 0)
 		end
@@ -212,6 +255,60 @@ local function setCarNoclip(state)
 	end
 end
 
+-- GLOBAL VEHICLE NOCLIP — affects ALL vehicles in Workspace
+local function applyGlobalVehicleNoclip()
+	for _, model in ipairs(Workspace:GetDescendants()) do
+		if isVehicleModel(model) then
+			for _, part in ipairs(model:GetDescendants()) do
+				if part:IsA("BasePart") then
+					if globalVehicleOriginalCanCollide[part] == nil then
+						globalVehicleOriginalCanCollide[part] = part.CanCollide
+					end
+					part.CanCollide = false
+				end
+			end
+		end
+	end
+end
+
+local function restoreGlobalVehicleNoclip()
+	for part, value in pairs(globalVehicleOriginalCanCollide) do
+		if part and part.Parent then
+			part.CanCollide = value
+		end
+	end
+	table.clear(globalVehicleOriginalCanCollide)
+end
+
+local function setGlobalVehicleNoclip(state)
+	globalVehicleNoclip = state
+	if state then
+		if not globalNoclipConn then
+			-- apply immediately
+			applyGlobalVehicleNoclip()
+			-- monitor for new vehicles spawning
+			globalNoclipConn = Workspace.DescendantAdded:Connect(function(descendant)
+				if not globalVehicleNoclip then return end
+				local model = descendant:FindFirstAncestorOfClass("Model")
+				if model and isVehicleModel(model) then
+					if descendant:IsA("BasePart") then
+						if globalVehicleOriginalCanCollide[descendant] == nil then
+							globalVehicleOriginalCanCollide[descendant] = descendant.CanCollide
+						end
+						descendant.CanCollide = false
+					end
+				end
+			end)
+		end
+	else
+		if globalNoclipConn then
+			globalNoclipConn:Disconnect()
+			globalNoclipConn = nil
+		end
+		restoreGlobalVehicleNoclip()
+	end
+end
+
 -- ===================== ESP =====================
 local function clearESP()
 	for player, objs in pairs(espObjects) do
@@ -313,7 +410,6 @@ Players.PlayerRemoving:Connect(function(player)
 	end
 end)
 
--- cleanup
 LocalPlayer.CharacterRemoving:Connect(function()
 	stopVehicleFly()
 	if playerNoclip then setPlayerNoclip(false) end
@@ -324,12 +420,12 @@ end)
 local Window = Rayfield:CreateWindow({
 	Name = "apathy v2",
 	LoadingTitle = "apathy v2",
-	LoadingSubtitle = "Kemerovo RP",
+	LoadingSubtitle = "Kemerovo RP — anti-flip",
 	Theme = "Amethyst",
 	ConfigurationSaving = {
 		Enabled = true,
 		FolderName = "apathy",
-		FileName = "apathy_v2"
+		FileName = "apathy_v2_antiflip"
 	},
 	Discord = { Enabled = false },
 	KeySystem = false
@@ -338,14 +434,14 @@ local Window = Rayfield:CreateWindow({
 local MainTab = Window:CreateTab("Main", 4483362458)
 MainTab:CreateSection("Vehicle")
 MainTab:CreateToggle({
-	Name = "Car Flight (straight)",
+	Name = "Car Flight (straight, no flip)",
 	CurrentValue = false,
 	Flag = "CarFlight",
 	Callback = function(Value)
 		setVehicleFly(Value)
 		Rayfield:Notify({
 			Title = "apathy v2",
-			Content = Value and "Car Flight ON — W/S forward, E/Q up/down. Yaw = mouse." or "Car Flight OFF",
+			Content = Value and "Car Flight ON — anti-flip active. W/S forward, E/Q up/down." or "Car Flight OFF",
 			Duration = 3
 		})
 	end
@@ -362,7 +458,7 @@ MainTab:CreateSlider({
 	end
 })
 MainTab:CreateToggle({
-	Name = "Car Noclip",
+	Name = "Car Noclip (your car)",
 	CurrentValue = false,
 	Flag = "CarNoclip",
 	Callback = function(Value)
@@ -370,6 +466,19 @@ MainTab:CreateToggle({
 		Rayfield:Notify({
 			Title = "apathy v2",
 			Content = Value and "Car Noclip ON" or "Car Noclip OFF",
+			Duration = 3
+		})
+	end
+})
+MainTab:CreateToggle({
+	Name = "Global Vehicle Noclip (ALL cars)",
+	CurrentValue = false,
+	Flag = "GlobalCarNoclip",
+	Callback = function(Value)
+		setGlobalVehicleNoclip(Value)
+		Rayfield:Notify({
+			Title = "apathy v2",
+			Content = Value and "Global Vehicle Noclip ON — all cars pass through walls" or "Global Vehicle Noclip OFF",
 			Duration = 3
 		})
 	end
@@ -405,12 +514,12 @@ MainTab:CreateToggle({
 MainTab:CreateSection("Info")
 MainTab:CreateParagraph({
 	Title = "Controls",
-	Content = "Car Flight (straight): sit → toggle → W forward, S backward, E/Space up, Q/Ctrl down. No A/D — vehicle only goes where the mouse points (yaw). No BodyGyro = no spin, camera free.\nCar Noclip: makes the whole vehicle pass through walls.\nESP: boxes + name + distance on all players."
+	Content = "Car Flight (anti-flip): sit → toggle → W forward, S backward, E/Space up, Q/Ctrl down. BodyGyro locks orientation upright — no flipping on collision.\nGlobal Vehicle Noclip: ALL vehicles in the map pass through walls and each other.\nESP: boxes + name + distance on all players."
 })
 
 Rayfield:Notify({
 	Title = "apathy v2",
-	Content = "loaded — straight-flight · yaw-only · ESP · noclip",
+	Content = "loaded — anti-flip · global vehicle noclip · yaw-only",
 	Duration = 4
 })
 Rayfield:LoadConfiguration()
